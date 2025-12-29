@@ -46,29 +46,34 @@ add_header_to_markdown() {
     local header_text="$2"
     local temp_file="${source_file%.*}_CONFLUENCE.md"
 
-    cp "$source_file" "$temp_file"
+    local first_header_line=$(grep -n "^#" "$source_file" | head -n 1 | cut -d: -f1)
 
-    if grep -q "^-->" "$temp_file"; then
-        # Insert after the closing comment tag
-        sed -i '' '/^-->/a\
-'"$header_text"'' "$temp_file"
+    if [ -n "$first_header_line" ]; then
+        HEADER_TEXT="$header_text" awk -v n="$first_header_line" 'NR==n {print ENVIRON["HEADER_TEXT"]} {print}' "$source_file" > "$temp_file"
     else
-        # Insert before the first H1 if no frontmatter block found, or fallback to top
-        if grep -q "^# " "$temp_file"; then
-            awk -v header="$header_text" '!f && /^# / { print header; print ""; f=1 } 1' "$temp_file" > "${temp_file}.tmp" && mv "${temp_file}.tmp" "$temp_file"
-        else
-            echo -e "$header_text\n\n$(cat "$temp_file")" > "$temp_file"
-        fi
+        {
+            echo "$header_text"
+            echo ""
+            cat "$source_file"
+        } > "$temp_file"
     fi
     echo "$temp_file"
 }
 
-# Slap a header on top of the confluence page.
-HEADER="**Note:** This page is automatically generated from [this document in git]($(get_markdown_url "PROPOSAL.md")). Please do not edit directly."
-TEMP_FILE=$(add_header_to_markdown "PROPOSAL.md" "$HEADER")
+push_to_confluence() {
+    local markdown_file="$1"
+    shift
+    
+    # Slap a header on top of the confluence page.
+    local header=$'<!-- -->\n'"**Note:** _This page is automatically generated from [this document in git]($(get_markdown_url "$markdown_file")). Please do not edit directly._"
+    local temp_file=$(add_header_to_markdown "$markdown_file" "$header")
 
-# Run mark on the temporary file
-mark -b "https://forhims.atlassian.net/wiki" --space "MLE" --title-from-h1 --drop-h1 --changes-only --strip-linebreaks -f "$TEMP_FILE"
+    # Run mark on the temporary file
+    mark -b "https://forhims.atlassian.net/wiki" --space "MLE" --title-from-h1 --drop-h1 --changes-only --strip-linebreaks -f "$temp_file" "$@"
 
-# Cleanup
-rm "$TEMP_FILE"
+    # Cleanup
+    rm "$temp_file"
+}
+
+push_to_confluence "PROPOSAL.md"
+push_to_confluence "PHASE_1_DESIGN.md" --mermaid-scale 2.0
