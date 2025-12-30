@@ -69,7 +69,7 @@ push_to_confluence() {
     local temp_file=$(add_header_to_markdown "$markdown_file" "$header")
 
     # Run mark on the temporary file
-    mark -b "https://forhims.atlassian.net/wiki" --space "MLE" --title-from-h1 --drop-h1 --changes-only --strip-linebreaks -f "$temp_file" "$@"
+    mark -b "https://forhims.atlassian.net/wiki" --space "MLE" --parents 'Swolness Pamphlet' --title-from-h1 --drop-h1 --changes-only --strip-linebreaks -f "$temp_file" "$@"
 
     # Cleanup
     rm "$temp_file"
