@@ -75,5 +75,6 @@ push_to_confluence() {
     rm "$temp_file"
 }
 
+push_to_confluence "VISION.md"
 push_to_confluence "PROPOSAL.md"
 push_to_confluence "PHASE_1_DESIGN.md" --mermaid-scale 2.0
