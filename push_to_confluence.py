@@ -2,9 +2,6 @@
 """
 Script to push Markdown to Confluence, handling image uploads and preserving inline comments.
 
-This is a (mostly) vibe-coded re-implementation of this Go program:
-
-   https://github.com/kovetskiy/mark
 
 It adds to it the ability to retain comments from the previous version of the
 Confluence page.
@@ -17,6 +14,7 @@ import os
 import sys
 import re
 import subprocess
+import shutil
 import logging
 import requests
 import difflib
@@ -24,6 +22,7 @@ import uuid
 import tempfile
 from atlassian import Confluence
 from bs4 import BeautifulSoup
+from bs4.element import CData
 from thefuzz import fuzz
 
 logging.basicConfig(
@@ -31,8 +30,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Used to detect whether the auto-header is already present (to avoid duplicates)
+AUTO_HEADER_PREFIX = "**Note:** _This page is automatically generated from "
 
-def run_command(command: List[str], input_text: Optional[str] = None) -> str:
+
+def run_command(
+    command: List[str], input_text: Optional[str] = None, cwd: Optional[str] = None
+) -> str:
     """Runs a shell command and returns stdout. Raises RuntimeError on failure."""
     try:
         process = subprocess.Popen(
@@ -41,6 +45,7 @@ def run_command(command: List[str], input_text: Optional[str] = None) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=cwd,
         )
         stdout, stderr = process.communicate(input=input_text)
 
@@ -53,11 +58,132 @@ def run_command(command: List[str], input_text: Optional[str] = None) -> str:
         raise
 
 
+def require_command(command_name: str, install_hint: str) -> None:
+    """Exit with a helpful message if a required CLI tool is not available on PATH."""
+    if shutil.which(command_name):
+        return
+    logger.error(f"Error: '{command_name}' is not installed.")
+    logger.error(install_hint)
+    sys.exit(1)
+
+
+def require_confluence_auth_env() -> None:
+    """
+    Fail fast if Confluence credentials are missing.
+
+    Supported env vars:
+    - CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN (Confluence Cloud API token via Basic Auth)
+    - CONFLUENCE_TOKEN (Bearer token; typically Confluence Server/DC PAT)
+    """
+    bearer = os.environ.get("CONFLUENCE_TOKEN")
+    email = os.environ.get("CONFLUENCE_EMAIL")
+    api_token = os.environ.get("CONFLUENCE_API_TOKEN")
+
+    if bearer or (email and api_token):
+        return
+
+    logger.error(
+        "Confluence auth is required via either CONFLUENCE_EMAIL/CONFLUENCE_API_TOKEN (Cloud) "
+        "or CONFLUENCE_TOKEN (Bearer)."
+    )
+    sys.exit(1)
+
+
+def _git(*args: str, cwd: str) -> Optional[str]:
+    """Best-effort git helper. Returns stripped stdout, or None if git fails."""
+    try:
+        out = run_command(["git", *args], cwd=cwd)
+        return out.strip()
+    except Exception:
+        logger.debug("git command failed in %s: git %s", cwd, " ".join(args))
+        return None
+
+
+def get_markdown_url(markdown_file: str) -> Optional[str]:
+    """
+    Best-effort link to a file in git web UI, matching the logic in push_to_confluence.sh.
+    Returns None if we can't determine repo/remote.
+    """
+    abs_file = os.path.abspath(markdown_file)
+    file_dir = os.path.dirname(abs_file)
+
+    repo_root = _git("rev-parse", "--show-toplevel", cwd=file_dir)
+    if not repo_root:
+        return None
+
+    remote_url = _git("config", "--get", "remote.origin.url", cwd=repo_root)
+    if not remote_url:
+        return None
+
+    branch = _git("branch", "--show-current", cwd=repo_root)
+    if not branch:
+        # Detached HEAD: fall back to commit SHA
+        sha = _git("rev-parse", "HEAD", cwd=repo_root)
+        branch = sha or "HEAD"
+
+    # Convert SSH remote to HTTPS, strip trailing .git
+    if remote_url.startswith("git@"):
+        # git@github.com:org/repo.git -> https://github.com/org/repo
+        remote_url = remote_url.replace(":", "/", 1).replace("git@", "https://", 1)
+    if remote_url.endswith(".git"):
+        remote_url = remote_url[:-4]
+
+    try:
+        rel_path = os.path.relpath(abs_file, repo_root)
+    except ValueError:
+        rel_path = os.path.basename(abs_file)
+
+    return f"{remote_url}/blob/{branch}/{rel_path}"
+
+
+def default_auto_header(markdown_file: str) -> str:
+    url = get_markdown_url(markdown_file)
+    if url:
+        return (
+            '**Note:** _This page is automatically generated from [this source document]'
+            f"({url}). Please do not edit directly._"
+        )
+    # Fallback when git info is unavailable
+    doc_name = os.path.basename(markdown_file) or "the source document"
+    return (
+        AUTO_HEADER_PREFIX
+        + f"the source document ({doc_name}). Please do not edit directly._"
+    )
+
+
+def inject_auto_header(markdown_file: str, body: str, extra_header: Optional[str]) -> str:
+    """
+    Always inject the auto header; optionally inject an additional header string.
+    De-dupes if the auto header is already present.
+    """
+    parts: List[str] = []
+    auto = default_auto_header(markdown_file)
+
+    haystack = (extra_header or "") + "\n" + body
+    if AUTO_HEADER_PREFIX not in haystack:
+        parts.append(auto)
+    if extra_header:
+        parts.append(extra_header)
+
+    if not parts:
+        return body
+    return "\n\n".join(parts + [body])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Push Markdown to Confluence.")
     parser.add_argument("file", help="Path to the Markdown file.")
     parser.add_argument("--space", required=True, help="Confluence space key.")
-    parser.add_argument("--parents", help="Parent page title (optional).")
+    # Historically this flag accepted a parent page title. We now use parent page id
+    # (Confluence content id) to avoid ambiguity.
+    parser.add_argument(
+        "--parent-id",
+        help="Parent Confluence page id (content id). If omitted, page is created at the space root.",
+    )
+    parser.add_argument(
+        "--parents",
+        help="DEPRECATED alias for --parent-id (expects a page id, not a title).",
+    )
     parser.add_argument(
         "--header", help="Markdown string to inject at the top of the page."
     )
@@ -77,6 +203,19 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Scale factor for Mermaid diagrams (default: 1.0).",
     )
+    parser.add_argument(
+        "--puppeteer-config",
+        default=os.environ.get("PUPPETEER_CONFIG")
+        or os.environ.get("MERMAID_PUPPETEER_CONFIG")
+        or os.path.join(os.path.expanduser("~"), "puppeteer-config.json"),
+        help=(
+            "Path to a Puppeteer config JSON file for mermaid-cli (mmdc -p). "
+            "This may be necessary if mermaid-cli's bundled Chromium doesn't match your system "
+            "and you need to point it at a local Chrome binary. "
+            "Can also be set via PUPPETEER_CONFIG or MERMAID_PUPPETEER_CONFIG. "
+            'Example config: {"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}'
+        ),
+    )
 
     return parser.parse_args()
 
@@ -85,12 +224,157 @@ def convert_markdown_to_html(markdown_content: str) -> str:
     """Converts Markdown content to HTML using pandoc."""
     try:
         return run_command(
-            ["pandoc", "--from=markdown-hard_line_breaks", "--to=html", "--wrap=none"],
+            ["pandoc", "--from=markdown+hard_line_breaks", "--to=html", "--wrap=none"],
             input_text=markdown_content,
         )
     except FileNotFoundError:
         logger.error("Pandoc not found. Please install pandoc.")
         raise
+
+
+def convert_html_code_blocks_to_confluence_macros(html: str) -> str:
+    """
+    Confluence Cloud often sanitizes raw <pre><code> blocks in "storage" format.
+    Convert them to Confluence's code macro to preserve newlines/formatting.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for pre in soup.find_all("pre"):
+        code = pre.find("code")
+        if not code:
+            continue
+
+        code_text = code.get_text()
+
+        # Pandoc emits classes like: class="language-python" or class="python"
+        lang = None
+        classes = code.get("class") or []
+        for c in classes:
+            if c.startswith("language-"):
+                lang = c.removeprefix("language-")
+                break
+        if not lang and classes:
+            lang = classes[0]
+
+        macro = soup.new_tag("ac:structured-macro", attrs={"ac:name": "code"})
+        if lang:
+            param = soup.new_tag("ac:parameter", attrs={"ac:name": "language"})
+            param.string = lang
+            macro.append(param)
+
+        body = soup.new_tag("ac:plain-text-body")
+        body.append(CData(code_text))
+        macro.append(body)
+
+        pre.replace_with(macro)
+
+    return str(soup)
+
+
+def normalize_confluence_list_spacing(html: str) -> str:
+    """
+    Pandoc emits "loose" lists as <li><p>...</p></li> when the markdown has blank
+    lines between items. Confluence renders <p> with extra vertical spacing,
+    causing visually separated list items.
+
+    Convert simple <li><p>...</p></li> into <li>...</li> (and allow nested ul/ol)
+    while keeping true multi-paragraph list items intact.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    blockish = {"p", "div", "pre", "table", "blockquote", "hr"}
+
+    def p_has_block_children(p_tag) -> bool:
+        return p_tag.find(list(blockish | {"ul", "ol"})) is not None
+
+    # 1) Remove/unwrap paragraph wrappers directly under list items to avoid Confluence
+    # rendering paragraph margins between items.
+    for li in soup.find_all("li"):
+        direct_ps = li.find_all("p", recursive=False)
+        for p in direct_ps:
+            # Keep true multi-block content intact.
+            if p_has_block_children(p):
+                continue
+            p.unwrap()
+
+    # 2) Drop empty paragraphs that can show up as visual blank lines in Confluence.
+    for p in soup.find_all("p"):
+        txt = p.get_text().replace("\xa0", "").strip()
+        if txt == "" and not p.find(True):
+            p.decompose()
+
+    return str(soup)
+
+
+def tighten_markdown_lists(markdown: str) -> str:
+    """
+    Remove blank lines between consecutive list items so Pandoc emits "tight" lists.
+    This avoids <li><p>..</p></li> output (which Confluence may render with extra spacing).
+
+    Only operates outside fenced code blocks.
+    """
+    lines = markdown.splitlines()
+    out: List[str] = []
+    in_fence = False
+
+    def is_list_item(line: str) -> bool:
+        return bool(
+            re.match(r"^\s*(?:\d+[.)]|[-*+])\s+\S", line)
+        )
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+
+        if not in_fence and stripped == "":
+            prev_line = lines[i - 1] if i > 0 else ""
+            next_line = lines[i + 1] if i + 1 < len(lines) else ""
+            if is_list_item(prev_line) and is_list_item(next_line):
+                # Drop this blank line to tighten the list
+                continue
+
+        out.append(line)
+
+    return "\n".join(out)
+
+
+def ensure_blank_line_before_lists(markdown: str) -> str:
+    """
+    When using Pandoc with hard_line_breaks, a newline does NOT necessarily end a
+    paragraph (it can become <br/>). That means ordered/bulleted lists can get
+    "stuck" inside a paragraph and render like:
+      <p><strong>Header</strong><br/>1. ...<br/>2. ...</p>
+
+    Ensure list blocks start on a new block by inserting a blank line before the
+    first list item when the previous line is non-blank and not already a list.
+
+    Only operates outside fenced code blocks.
+    """
+    lines = markdown.splitlines()
+    out: List[str] = []
+    in_fence = False
+
+    def is_list_item(line: str) -> bool:
+        return bool(re.match(r"^\s*(?:\d+[.)]|[-*+])\s+\S", line))
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+
+        if not in_fence and is_list_item(line):
+            prev = out[-1] if out else ""
+            if prev.strip() != "" and not is_list_item(prev):
+                out.append("")
+
+        out.append(line)
+
+    return "\n".join(out)
 
 
 def extract_title_and_body(markdown_content: str) -> Tuple[Optional[str], str]:
@@ -128,7 +412,11 @@ def ensure_page_exists(
 
 
 def process_mermaid_images(
-    confluence, page_id: str, markdown_content: str, scale: float = 1.0
+    confluence,
+    page_id: str,
+    markdown_content: str,
+    scale: float = 1.0,
+    puppeteer_config: Optional[str] = None,
 ) -> str:
     """
     Finds mermaid code blocks, renders them to PNG using mmdc, uploads them,
@@ -152,6 +440,13 @@ def process_mermaid_images(
         try:
             # 1. Render to PNG
             cmd = ["mmdc", "-i", mmd_path, "-o", png_path, "-b", "white"]
+            if puppeteer_config:
+                if os.path.exists(puppeteer_config):
+                    cmd.extend(["-p", puppeteer_config])
+                else:
+                    logger.warning(
+                        f"Puppeteer config not found at {puppeteer_config}; running mmdc without -p"
+                    )
             if scale != 1.0:
                 cmd.extend(["--scale", str(scale)])
 
@@ -166,7 +461,10 @@ def process_mermaid_images(
 
         except (RuntimeError, FileNotFoundError):
             logger.exception(
-                "Failed to render Mermaid diagram. Please ensure mermaid-cli is installed (npm install -g @mermaid-js/mermaid-cli)."
+                "Failed to render Mermaid diagram. Please ensure mermaid-cli is installed "
+                "(npm install -g @mermaid-js/mermaid-cli). If you see a Chromium/Chrome mismatch, "
+                "try providing --puppeteer-config (or PUPPETEER_CONFIG) with e.g. "
+                '{"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}.'
             )
             raise
         finally:
@@ -373,12 +671,18 @@ def preserve_comments(old_html: str, new_html: str) -> str:
 def main() -> None:
     args = parse_args()
 
+    # Fail fast on missing Confluence credentials before doing any work.
+    require_confluence_auth_env()
+
     try:
         with open(args.file, "r") as f:
             content = f.read()
     except FileNotFoundError:
         logger.error(f"Markdown file not found: {args.file}")
         sys.exit(1)
+
+    # External tool checks, done early to fail fast.
+    require_command("pandoc", "Please install it via brew install pandoc")
 
     # 1. Markdown Processing
     title, body_content = extract_title_and_body(content)
@@ -390,34 +694,59 @@ def main() -> None:
     logger.info(f"Page Title: {title}")
 
     # 2. Header Injection
-    if args.header:
-        body_content = args.header + "\n\n" + body_content
+    # Always inject the "auto-generated" note header (matching push_to_confluence.sh),
+    # and optionally include an additional user-provided header.
+    body_content = inject_auto_header(args.file, body_content, extra_header=args.header)
+
+    # With hard_line_breaks enabled, lists can accidentally become paragraph text unless
+    # they are preceded by a blank line.
+    body_content = ensure_blank_line_before_lists(body_content)
+
+    # Tighten lists before Pandoc conversion to avoid loose-list spacing in Confluence.
+    body_content = tighten_markdown_lists(body_content)
+
+    # If Mermaid blocks exist, ensure mermaid-cli is installed before we do any API work.
+    if re.search(r"```mermaid\s*\n(.*?)\n\s*```", body_content, flags=re.DOTALL):
+        require_command("mmdc", "Please install it via npm install -g @mermaid-js/mermaid-cli")
 
     # Connect to Confluence
     # Auth
-    username = os.environ.get("MARK_USERNAME")
-    password = os.environ.get("MARK_PASSWORD")
+    #
+    # Confluence Cloud "API tokens" are used via HTTP Basic Auth:
+    #   username = Atlassian account email
+    #   password = API token
+    #
+    # Confluence Server/Data Center PATs are typically used via Bearer auth:
+    #   Authorization: Bearer <token>
+    #
+    # Supported env vars:
+    # - CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN (Confluence Cloud)
+    # - CONFLUENCE_TOKEN (Bearer token; typically for Server/DC PATs)
+    bearer_token = os.environ.get("CONFLUENCE_TOKEN")
+    email = os.environ.get("CONFLUENCE_EMAIL")
+    api_token = os.environ.get("CONFLUENCE_API_TOKEN")
 
-    if not username or not password:
-        logger.error(
-            "Username and password are required (MARK_USERNAME/MARK_PASSWORD env vars)."
-        )
-        sys.exit(1)
-
-    confluence = Confluence(
-        url=args.confluence_url, username=username, password=password, cloud=True
-    )
-
-    # Get parent ID if provided
-    parent_id = None
-    if args.parents:
-        parent_page = confluence.get_page_by_title(args.space, args.parents)
-        if parent_page:
-            parent_id = parent_page["id"]
-        else:
-            logger.warning(
-                f"Parent page '{args.parents}' not found. Creating at root of space."
+    if bearer_token:
+        confluence = Confluence(url=args.confluence_url, token=bearer_token)
+    else:
+        if not email or not api_token:
+            logger.error(
+                "Confluence auth is required via either CONFLUENCE_EMAIL/CONFLUENCE_API_TOKEN (Cloud) or CONFLUENCE_TOKEN (Bearer)."
             )
+            sys.exit(1)
+
+        confluence = Confluence(url=args.confluence_url, username=email, password=api_token, cloud=True)
+
+    # Parent page handling (id only)
+    parent_id = args.parent_id or args.parents
+    if parent_id:
+        parent_id = str(parent_id).strip()
+        if not parent_id.isdigit():
+            logger.error(
+                "--parent-id/--parents must be a Confluence page id (digits). "
+                "Page title lookup is no longer supported."
+            )
+            sys.exit(1)
 
     # Ensure page exists to get ID for attachments
     page_id = ensure_page_exists(confluence, args.space, title, parent_id)
@@ -426,7 +755,11 @@ def main() -> None:
     base_path = os.path.dirname(os.path.abspath(args.file))
     body_content = process_images(confluence, page_id, body_content, base_path)
     body_content = process_mermaid_images(
-        confluence, page_id, body_content, scale=args.scale_mermaid
+        confluence,
+        page_id,
+        body_content,
+        scale=args.scale_mermaid,
+        puppeteer_config=args.puppeteer_config,
     )
 
     # 4. HTML Conversion
@@ -453,7 +786,11 @@ def main() -> None:
     )
     current_body = current_page.get("body", {}).get("storage", {}).get("value", "")
 
+    html_content = convert_html_code_blocks_to_confluence_macros(html_content)
+    html_content = normalize_confluence_list_spacing(html_content)
     final_html = preserve_comments(current_body, html_content)
+    # preserve_comments() reparses HTML; run list normalization again defensively.
+    final_html = normalize_confluence_list_spacing(final_html)
 
     # 6. Page Update
     logger.info(f"Updating page {page_id}...")
