@@ -30,8 +30,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Used to detect whether the auto-header is already present (to avoid duplicates)
-AUTO_HEADER_PREFIX = "**Note:** _This page is automatically generated from "
 
 
 def run_command(
@@ -68,23 +66,14 @@ def require_command(command_name: str, install_hint: str) -> None:
 
 
 def require_confluence_auth_env() -> None:
-    """
-    Fail fast if Confluence credentials are missing.
-
-    Supported env vars:
-    - CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN (Confluence Cloud API token via Basic Auth)
-    - CONFLUENCE_TOKEN (Bearer token; typically Confluence Server/DC PAT)
-    """
-    bearer = os.environ.get("CONFLUENCE_TOKEN")
-    email = os.environ.get("CONFLUENCE_EMAIL")
-    api_token = os.environ.get("CONFLUENCE_API_TOKEN")
-
-    if bearer or (email and api_token):
+    "Fail fast if Confluence credentials are missing."
+    if os.environ.get("CONFLUENCE_EMAIL") and os.environ.get("CONFLUENCE_API_TOKEN"):
         return
 
     logger.error(
-        "Confluence auth is required via either CONFLUENCE_EMAIL/CONFLUENCE_API_TOKEN (Cloud) "
-        "or CONFLUENCE_TOKEN (Bearer)."
+        "Confluence auth is required via CONFLUENCE_EMAIL and CONFLUENCE_API_TOKEN.\n"
+        "You can create a Confluence API token by visiting:\n"
+        "https://id.atlassian.com/manage-profile/security/api-tokens"
     )
     sys.exit(1)
 
@@ -96,7 +85,7 @@ def _git(*args: str, cwd: str) -> Optional[str]:
         return out.strip()
     except Exception:
         logger.debug("git command failed in %s: git %s", cwd, " ".join(args))
-        return None
+        raise
 
 
 def get_markdown_url(markdown_file: str) -> Optional[str]:
@@ -138,37 +127,10 @@ def get_markdown_url(markdown_file: str) -> Optional[str]:
 
 def default_auto_header(markdown_file: str) -> str:
     url = get_markdown_url(markdown_file)
-    if url:
-        return (
-            '**Note:** _This page is automatically generated from [this source document]'
-            f"({url}). Please do not edit directly._"
-        )
-    # Fallback when git info is unavailable
-    doc_name = os.path.basename(markdown_file) or "the source document"
     return (
-        AUTO_HEADER_PREFIX
-        + f"the source document ({doc_name}). Please do not edit directly._"
+        '**Note:** _This page is automatically generated from [this source document]'
+        f"({url}). Please do not edit directly._"
     )
-
-
-def inject_auto_header(markdown_file: str, body: str, extra_header: Optional[str]) -> str:
-    """
-    Always inject the auto header; optionally inject an additional header string.
-    De-dupes if the auto header is already present.
-    """
-    parts: List[str] = []
-    auto = default_auto_header(markdown_file)
-
-    haystack = (extra_header or "") + "\n" + body
-    if AUTO_HEADER_PREFIX not in haystack:
-        parts.append(auto)
-    if extra_header:
-        parts.append(extra_header)
-
-    if not parts:
-        return body
-    return "\n\n".join(parts + [body])
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Push Markdown to Confluence.")
@@ -178,11 +140,7 @@ def parse_args() -> argparse.Namespace:
     # (Confluence content id) to avoid ambiguity.
     parser.add_argument(
         "--parent-id",
-        help="Parent Confluence page id (content id). If omitted, page is created at the space root.",
-    )
-    parser.add_argument(
-        "--parents",
-        help="DEPRECATED alias for --parent-id (expects a page id, not a title).",
+        help="Parent Confluence page id (content id) or title. If omitted, page is created at the space root.",
     )
     parser.add_argument(
         "--header", help="Markdown string to inject at the top of the page."
@@ -668,6 +626,30 @@ def preserve_comments(old_html: str, new_html: str) -> str:
     return str(soup_new)
 
 
+def resolve_parent_page(confluence, space: str, parent_identifier: Optional[str]) -> Optional[str]:
+    """
+    Resolves a parent page identifier (ID or Title) to a Page ID.
+    If it's digits, assumes ID. Otherwise, looks up by title in the space.
+    """
+    if not parent_identifier:
+        return None
+
+    parent_identifier = str(parent_identifier).strip()
+
+    if parent_identifier.isdigit():
+        return parent_identifier
+
+    # It's a title, look it up
+    logger.info(f"Resolving parent page by title: '{parent_identifier}'...")
+    page = confluence.get_page_by_title(space, parent_identifier)
+    if not page:
+        logger.error(f"Parent page not found by title: '{parent_identifier}' in space '{space}'")
+        sys.exit(1)
+    
+    return page["id"]
+
+
+
 def main() -> None:
     args = parse_args()
 
@@ -694,9 +676,9 @@ def main() -> None:
     logger.info(f"Page Title: {title}")
 
     # 2. Header Injection
-    # Always inject the "auto-generated" note header (matching push_to_confluence.sh),
-    # and optionally include an additional user-provided header.
-    body_content = inject_auto_header(args.file, body_content, extra_header=args.header)
+    # Inject the user-provided header if present, otherwise inject the auto-generated note header.
+    header = args.header or default_auto_header(args.file)
+    body_content = f"{header}\n\n{body_content}"
 
     # With hard_line_breaks enabled, lists can accidentally become paragraph text unless
     # they are preceded by a blank line.
@@ -710,43 +692,15 @@ def main() -> None:
         require_command("mmdc", "Please install it via npm install -g @mermaid-js/mermaid-cli")
 
     # Connect to Confluence
-    # Auth
-    #
-    # Confluence Cloud "API tokens" are used via HTTP Basic Auth:
-    #   username = Atlassian account email
-    #   password = API token
-    #
-    # Confluence Server/Data Center PATs are typically used via Bearer auth:
-    #   Authorization: Bearer <token>
-    #
-    # Supported env vars:
-    # - CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN (Confluence Cloud)
-    # - CONFLUENCE_TOKEN (Bearer token; typically for Server/DC PATs)
-    bearer_token = os.environ.get("CONFLUENCE_TOKEN")
-    email = os.environ.get("CONFLUENCE_EMAIL")
-    api_token = os.environ.get("CONFLUENCE_API_TOKEN")
+    confluence = Confluence(
+        url=args.confluence_url,
+        username=os.environ.get("CONFLUENCE_EMAIL"),
+        password=os.environ.get("CONFLUENCE_API_TOKEN"),
+        cloud=True,
+    )
 
-    if bearer_token:
-        confluence = Confluence(url=args.confluence_url, token=bearer_token)
-    else:
-        if not email or not api_token:
-            logger.error(
-                "Confluence auth is required via either CONFLUENCE_EMAIL/CONFLUENCE_API_TOKEN (Cloud) or CONFLUENCE_TOKEN (Bearer)."
-            )
-            sys.exit(1)
-
-        confluence = Confluence(url=args.confluence_url, username=email, password=api_token, cloud=True)
-
-    # Parent page handling (id only)
-    parent_id = args.parent_id or args.parents
-    if parent_id:
-        parent_id = str(parent_id).strip()
-        if not parent_id.isdigit():
-            logger.error(
-                "--parent-id/--parents must be a Confluence page id (digits). "
-                "Page title lookup is no longer supported."
-            )
-            sys.exit(1)
+    # Parent page handling (id or title)
+    parent_id = resolve_parent_page(confluence, args.space, args.parent_id)
 
     # Ensure page exists to get ID for attachments
     page_id = ensure_page_exists(confluence, args.space, title, parent_id)
