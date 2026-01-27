@@ -31,7 +31,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-
 def run_command(
     command: List[str], input_text: Optional[str] = None, cwd: Optional[str] = None
 ) -> str:
@@ -128,9 +127,10 @@ def get_markdown_url(markdown_file: str) -> Optional[str]:
 def default_auto_header(markdown_file: str) -> str:
     url = get_markdown_url(markdown_file)
     return (
-        '**Note:** _This page is automatically generated from [this source document]'
+        "**Note:** _This page is automatically generated from [this source document]"
         f"({url}). Please do not edit directly._"
     )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Push Markdown to Confluence.")
@@ -153,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--copy-comments-from-version",
         type=int,
-        help="Specific version of the page to fetch for comment preservation.",
+        help="Specific version of the page to fetch for comment preservation. Defaults to the latest version.",
     )
     parser.add_argument(
         "--scale-mermaid",
@@ -276,9 +276,7 @@ def tighten_markdown_lists(markdown: str) -> str:
     in_fence = False
 
     def is_list_item(line: str) -> bool:
-        return bool(
-            re.match(r"^\s*(?:\d+[.)]|[-*+])\s+\S", line)
-        )
+        return bool(re.match(r"^\s*(?:\d+[.)]|[-*+])\s+\S", line))
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -626,7 +624,9 @@ def preserve_comments(old_html: str, new_html: str) -> str:
     return str(soup_new)
 
 
-def resolve_parent_page(confluence, space: str, parent_identifier: Optional[str]) -> Optional[str]:
+def resolve_parent_page(
+    confluence, space: str, parent_identifier: Optional[str]
+) -> Optional[str]:
     """
     Resolves a parent page identifier (ID or Title) to a Page ID.
     If it's digits, assumes ID. Otherwise, looks up by title in the space.
@@ -643,11 +643,12 @@ def resolve_parent_page(confluence, space: str, parent_identifier: Optional[str]
     logger.info(f"Resolving parent page by title: '{parent_identifier}'...")
     page = confluence.get_page_by_title(space, parent_identifier)
     if not page:
-        logger.error(f"Parent page not found by title: '{parent_identifier}' in space '{space}'")
+        logger.error(
+            f"Parent page not found by title: '{parent_identifier}' in space '{space}'"
+        )
         sys.exit(1)
-    
-    return page["id"]
 
+    return page["id"]
 
 
 def main() -> None:
@@ -689,7 +690,9 @@ def main() -> None:
 
     # If Mermaid blocks exist, ensure mermaid-cli is installed before we do any API work.
     if re.search(r"```mermaid\s*\n(.*?)\n\s*```", body_content, flags=re.DOTALL):
-        require_command("mmdc", "Please install it via npm install -g @mermaid-js/mermaid-cli")
+        require_command(
+            "mmdc", "Please install it via npm install -g @mermaid-js/mermaid-cli"
+        )
 
     # Connect to Confluence
     confluence = Confluence(
