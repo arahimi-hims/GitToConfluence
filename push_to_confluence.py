@@ -182,7 +182,7 @@ def convert_markdown_to_html(markdown_content: str) -> str:
     """Converts Markdown content to HTML using pandoc."""
     try:
         return run_command(
-            ["pandoc", "--from=markdown+hard_line_breaks", "--to=html", "--wrap=none"],
+            ["pandoc", "--from=markdown-hard_line_breaks", "--to=html", "--wrap=none"],
             input_text=markdown_content,
         )
     except FileNotFoundError:
@@ -648,6 +648,7 @@ def resolve_parent_page(
         )
         sys.exit(1)
 
+    logger.info(f"Resolved parent page by title: page_id={page['id']}")
     return page["id"]
 
 
@@ -745,9 +746,9 @@ def main() -> None:
 
     html_content = convert_html_code_blocks_to_confluence_macros(html_content)
     html_content = normalize_confluence_list_spacing(html_content)
-    final_html = preserve_comments(current_body, html_content)
+    html_content = preserve_comments(current_body, html_content)
     # preserve_comments() reparses HTML; run list normalization again defensively.
-    final_html = normalize_confluence_list_spacing(final_html)
+    final_html = normalize_confluence_list_spacing(html_content)
 
     # 6. Page Update
     logger.info(f"Updating page {page_id}...")
