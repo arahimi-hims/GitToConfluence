@@ -351,6 +351,36 @@ def extract_title_and_body(markdown_content: str) -> Tuple[Optional[str], str]:
     return title, "\n".join(body_lines)
 
 
+def set_or_update_property(confluence, page_id: str, key: str, value: str) -> None:
+    """
+    Sets a page property. If it already exists, updates it.
+    """
+    data = {"key": key, "value": value}
+    try:
+        confluence.set_page_property(page_id, data)
+    except Exception as e:
+        # Check if it's a conflict/duplicate key error
+        err_str = str(e)
+        if (
+            "ConflictException" in err_str
+            or "409" in err_str
+            or "duplicate.key" in err_str
+        ):
+            logger.info(f"Property {key} exists, updating...")
+            try:
+                # Fetch existing property to get version
+                prop = confluence.get_page_property(page_id, key)
+                if prop:
+                    version_number = prop.get("version", {}).get("number", 0)
+                    data["version"] = {"number": version_number + 1}
+
+                confluence.update_page_property(page_id, data)
+            except Exception as update_error:
+                logger.warning(f"Failed to update property {key}: {update_error}")
+        else:
+            logger.warning(f"Failed to set property {key}: {e}")
+
+
 def ensure_page_exists(
     confluence, space: str, title: str, parent_id: Optional[str] = None
 ) -> str:
@@ -362,7 +392,12 @@ def ensure_page_exists(
     logger.info(f"Page '{title}' not found. Creating...")
     # Create with minimal content initially
     page = confluence.create_page(
-        space=space, title=title, body="<p>Placeholder content</p>", parent_id=parent_id
+        space=space,
+        title=title,
+        body="<p>Placeholder content</p>",
+        parent_id=parent_id,
+        representation="storage",
+        editor="v2",
     )
     return page["id"]
 
@@ -652,6 +687,31 @@ def resolve_parent_page(
     return page["id"]
 
 
+def enforce_page_width_workaround(confluence, page_id: str) -> None:
+    """
+    Force reset of page width. There seems to be a bug in confluence that
+    requires us to toggle the width of the page to default. Without this, the
+    title has a different margin than the body. I discovered this workaround
+    by actually toggling the width in the UI editor. Setting the width to default
+    doesn't cause an update. You actually have to toggle between two settings.
+    """
+    logger.info("Working around confluence page width bug...")
+
+    # Set to full-width first
+    set_or_update_property(
+        confluence, page_id, "content-appearance-published", "full-width"
+    )
+    set_or_update_property(
+        confluence, page_id, "content-appearance-draft", "full-width"
+    )
+
+    # Then set to default (narrow)
+    set_or_update_property(
+        confluence, page_id, "content-appearance-published", "default"
+    )
+    set_or_update_property(confluence, page_id, "content-appearance-draft", "default")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -766,6 +826,8 @@ def main() -> None:
     except requests.exceptions.RequestException:
         logger.exception("Failed to update page")
         sys.exit(1)
+
+    enforce_page_width_workaround(confluence, page_id)
 
     base_url = result["_links"].get("base", args.confluence_url).rstrip("/")
     webui = result["_links"]["webui"]
