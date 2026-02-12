@@ -128,7 +128,8 @@ def default_auto_header(markdown_file: str) -> str:
     url = get_markdown_url(markdown_file)
     return (
         "**Note:** _This page is automatically generated from [this source document]"
-        f"({url}). Please do not edit directly._"
+        f"({url}) by [this tool](https://github.com/arahimi-hims/GitToConfluence)."
+	" Please do not edit directly._"
     )
 
 
