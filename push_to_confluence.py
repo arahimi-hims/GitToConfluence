@@ -229,6 +229,94 @@ def convert_html_code_blocks_to_confluence_macros(html: str) -> str:
     return str(soup)
 
 
+def normalize_table_widths(html: str) -> str:
+    """
+    Strip forced table widths from pandoc HTML output.
+
+    Pandoc generates ``<table style="width:100%;">`` and ``<colgroup>`` with
+    per-column width styles.  When Confluence ingests these, it infers
+    ``data-layout="full-width"`` and locks every column to equal widths —
+    even for small tables.  Stripping them before push lets Confluence
+    auto-size tables based on content.
+    """
+    # Remove style="width:...%" from <table> elements
+    html = re.sub(
+        r'(<table[^>]*?)\s+style="width:\s*[\d.]+%\s*;?"',
+        r'\1',
+        html,
+    )
+
+    # Remove entire <colgroup>...</colgroup> sections
+    html = re.sub(
+        r'<colgroup>.*?</colgroup>\s*',
+        '',
+        html,
+        flags=re.DOTALL,
+    )
+
+    return html
+
+
+def convert_heading_ids_to_confluence_anchors(html: str) -> str:
+    """
+    Convert Pandoc-generated heading ``id`` attributes into Confluence anchor
+    macros, and rewrite same-page ``#fragment`` links to use ``ac:link``
+    with those anchors.
+
+    Pandoc produces ``<h2 id="some-slug">Title</h2>``.  Confluence strips
+    ``id`` attributes on ingest, so fragment links (``<a href="#some-slug">``)
+    break.  This function:
+
+    1. Nests a Confluence anchor macro **inside** each ``<hN id="slug">``
+       heading (so it stays inline and doesn't create block-level spacing).
+    2. Rewrites ``<a href="#slug">text</a>`` to a Confluence ``ac:link``
+       that references the anchor.
+    """
+    # Step 1: Collect all heading ids and insert anchor macros INSIDE headings
+    heading_ids: set = set()
+
+    def _insert_anchor(m: re.Match) -> str:
+        tag = m.group(1)       # e.g. "h2" or "h3"
+        anchor_id = m.group(2)  # e.g. "some-heading-slug"
+        rest = m.group(3)       # attributes after the id, if any
+        content = m.group(4)    # heading inner text
+        heading_ids.add(anchor_id)
+        anchor_macro = (
+            f'<ac:structured-macro ac:name="anchor" ac:schema-version="1">'
+            f'<ac:parameter ac:name="">{anchor_id}</ac:parameter>'
+            f'</ac:structured-macro>'
+        )
+        # Place anchor INSIDE the heading to keep it inline (avoids block spacing)
+        return f'<{tag}{rest}>{anchor_macro}{content}</{tag}>'
+
+    html = re.sub(
+        r'<(h[1-6])\s+id="([^"]+)"([^>]*)>(.*?)</\1>',
+        _insert_anchor,
+        html,
+    )
+
+    # Step 2: Rewrite same-page fragment links to ac:link with anchor ref
+    def _rewrite_link(m: re.Match) -> str:
+        fragment = m.group(1)
+        link_text = m.group(2)
+        if fragment in heading_ids:
+            return (
+                f'<ac:link ac:anchor="{fragment}">'
+                f'<ac:plain-text-link-body><![CDATA[{link_text}]]>'
+                f'</ac:plain-text-link-body></ac:link>'
+            )
+        # Not a heading anchor — leave as-is (could be an appendix anchor, etc.)
+        return m.group(0)
+
+    html = re.sub(
+        r'<a href="#([^"]+)">(.*?)</a>',
+        _rewrite_link,
+        html,
+    )
+
+    return html
+
+
 def normalize_confluence_list_spacing(html: str) -> str:
     """
     Pandoc emits "loose" lists as <li><p>...</p></li> when the markdown has blank
@@ -804,6 +892,8 @@ def main() -> None:
     )
     current_body = current_page.get("body", {}).get("storage", {}).get("value", "")
 
+    html_content = normalize_table_widths(html_content)
+    html_content = convert_heading_ids_to_confluence_anchors(html_content)
     html_content = convert_html_code_blocks_to_confluence_macros(html_content)
     html_content = normalize_confluence_list_spacing(html_content)
     html_content = preserve_comments(current_body, html_content)
