@@ -1,11 +1,18 @@
+import json
 import logging
+import tempfile
+import os
 from unittest.mock import MagicMock, patch
 from push_to_confluence import (
+    build_page_properties_html,
     convert_heading_ids_to_confluence_anchors,
     extract_title_and_body,
     normalize_table_widths,
+    parse_page_properties_arg,
     preserve_comments,
     process_images,
+    process_mermaid_images,
+    _render_cell_value,
 )
 
 
@@ -358,6 +365,122 @@ class TestConvertHeadingIdsToConfluenceAnchors:
         assert result == html
 
 
+class TestRenderCellValue:
+    def test_plain_string(self):
+        result = _render_cell_value("Weight Loss")
+        assert result == "Weight Loss"
+
+    def test_plain_string_html_escaped(self):
+        result = _render_cell_value("A <b>bold</b> & 'quoted' value")
+        assert "&lt;b&gt;" in result
+        assert "&amp;" in result
+
+    def test_status_lozenge(self):
+        result = _render_cell_value({"type": "status", "text": "DRAFT", "color": "yellow"})
+        assert 'ac:name="details"' not in result
+        assert 'ac:name="status"' in result
+        assert 'ac:name="colour">Yellow</ac:parameter>' in result
+        assert 'ac:name="title">DRAFT</ac:parameter>' in result
+
+    def test_status_lozenge_color_capitalized(self):
+        result = _render_cell_value({"type": "status", "text": "APPROVED", "color": "blue"})
+        assert 'ac:name="colour">Blue</ac:parameter>' in result
+
+    def test_status_lozenge_default_color(self):
+        result = _render_cell_value({"type": "status", "text": "UNKNOWN"})
+        assert 'ac:name="colour">Grey</ac:parameter>' in result
+
+    def test_unknown_type_falls_back_to_string(self):
+        result = _render_cell_value({"type": "unknown_widget", "foo": "bar"})
+        assert "unknown_widget" in result
+
+
+class TestBuildPagePropertiesHtml:
+    def test_basic_text_rows(self):
+        rows = [
+            {"label": "Title", "value": "My RFC"},
+            {"label": "Squad", "value": "Weight Loss"},
+        ]
+        result = build_page_properties_html(rows)
+        assert 'ac:name="details"' in result
+        assert "<ac:rich-text-body>" in result
+        assert "<strong>Title</strong>" in result
+        assert "My RFC" in result
+        assert "<strong>Squad</strong>" in result
+        assert "Weight Loss" in result
+
+    def test_status_lozenge_row(self):
+        rows = [
+            {"label": "Status", "value": {"type": "status", "text": "APPROVED", "color": "blue"}},
+        ]
+        result = build_page_properties_html(rows)
+        assert 'ac:name="details"' in result
+        assert "<strong>Status</strong>" in result
+        assert 'ac:name="status"' in result
+        assert 'ac:name="title">APPROVED</ac:parameter>' in result
+
+    def test_mixed_rows(self):
+        rows = [
+            {"label": "Title", "value": "My RFC"},
+            {"label": "RFC Type", "value": {"type": "status", "text": "GLOBAL", "color": "green"}},
+            {"label": "Status", "value": {"type": "status", "text": "DRAFT", "color": "yellow"}},
+            {"label": "Squad", "value": "Weight Loss"},
+            {"label": "Notes", "value": ""},
+        ]
+        result = build_page_properties_html(rows)
+        assert result.count("<tr>") == 5
+        assert "GLOBAL" in result
+        assert "DRAFT" in result
+        assert "Weight Loss" in result
+
+    def test_row_order_preserved(self):
+        rows = [
+            {"label": "First", "value": "1"},
+            {"label": "Second", "value": "2"},
+            {"label": "Third", "value": "3"},
+        ]
+        result = build_page_properties_html(rows)
+        assert result.index("First") < result.index("Second") < result.index("Third")
+
+    def test_empty_rows(self):
+        result = build_page_properties_html([])
+        assert 'ac:name="details"' in result
+        assert "<tbody></tbody>" in result
+
+
+class TestParsePagePropertiesArg:
+    def test_inline_json(self):
+        raw = '[{"label": "Title", "value": "My RFC"}]'
+        result = parse_page_properties_arg(raw)
+        assert len(result) == 1
+        assert result[0]["label"] == "Title"
+
+    def test_file_reference(self):
+        data = [{"label": "Squad", "value": "WL"}]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            result = parse_page_properties_arg(f"@{f.name}")
+        os.unlink(f.name)
+        assert len(result) == 1
+        assert result[0]["value"] == "WL"
+
+    def test_invalid_json_exits(self):
+        import pytest
+        with pytest.raises(SystemExit):
+            parse_page_properties_arg("not json")
+
+    def test_non_array_exits(self):
+        import pytest
+        with pytest.raises(SystemExit):
+            parse_page_properties_arg('{"label": "Title"}')
+
+    def test_missing_file_exits(self):
+        import pytest
+        with pytest.raises(SystemExit):
+            parse_page_properties_arg("@/nonexistent/file.json")
+
+
 class TestProcessImages:
     def test_process_images_with_attributes(self):
         confluence = MagicMock()
@@ -387,3 +510,134 @@ class TestProcessImages:
             '<ac:image ><ri:attachment ri:filename="image.png" /></ac:image>' in result
         )
         confluence.attach_file.assert_called_once()
+
+
+class TestProcessMermaidImages:
+    def _run(self, confluence, page_id, markdown, **kwargs):
+        with patch("push_to_confluence.run_command"):
+            with patch("push_to_confluence.os.path.exists", return_value=True):
+                with patch("push_to_confluence.os.remove"):
+                    return process_mermaid_images(confluence, page_id, markdown, **kwargs)
+
+    def _resolve(self, content, placeholders):
+        """Substitute placeholders to get the final HTML, matching main() logic."""
+        for placeholder, real_html in placeholders.items():
+            content = content.replace(f"<p>{placeholder}</p>", real_html)
+            content = content.replace(placeholder, real_html)
+        return content
+
+    def test_returns_placeholder_and_dict(self):
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = "```mermaid\ngraph TD\n    A --> B\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+
+        # Content should have a placeholder, not raw XML
+        assert "MERMAID_PLACEHOLDER_" in content
+        assert "ac:image" not in content
+        assert len(placeholders) == 1
+
+        # The placeholder value should contain the image macro
+        real_html = list(placeholders.values())[0]
+        assert "ac:image" in real_html
+
+    def test_default_no_source_block(self):
+        """By default, only the image macro is emitted — no source code block."""
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = "```mermaid\ngraph TD\n    A --> B\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+        result = self._resolve(content, placeholders)
+
+        assert "ac:image" in result
+        assert 'ac:name="code"' not in result
+        assert "CDATA" not in result
+
+    def test_include_source_adds_collapsed_code_block(self):
+        confluence = MagicMock()
+        page_id = "12345"
+        mermaid_src = "graph TD\n    A[Start] --> B[End]"
+        markdown = f"```mermaid\n{mermaid_src}\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown, include_source=True)
+        result = self._resolve(content, placeholders)
+
+        # Image macro present
+        assert '<ac:image ac:width="100%">' in result
+        assert "ri:attachment" in result
+
+        # Source preserved in a collapsed code macro
+        assert 'ac:name="code"' in result
+        assert 'ac:name="language">mermaid</ac:parameter>' in result
+        assert 'ac:name="collapse">true</ac:parameter>' in result
+        assert "graph TD" in result
+        assert "A[Start] --> B[End]" in result
+
+    def test_include_source_arrows_no_escaping(self):
+        """Mermaid arrows (-->) are preserved verbatim inside CDATA."""
+        confluence = MagicMock()
+        page_id = "12345"
+        mermaid_src = "stateDiagram-v2\n    [*] --> Active"
+        markdown = f"```mermaid\n{mermaid_src}\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown, include_source=True)
+        result = self._resolve(content, placeholders)
+
+        assert "[*] --> Active" in result
+        assert "&#45;" not in result
+        assert "CDATA[" in result
+
+    def test_mermaid_image_macro_present(self):
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = "```mermaid\ngraph LR\n    A --> B\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+        result = self._resolve(content, placeholders)
+
+        assert '<ac:image ac:width="100%">' in result
+        assert "ri:attachment" in result
+        assert 'ri:filename="mermaid-' in result
+
+    def test_multiple_diagrams_get_separate_placeholders(self):
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = (
+            "```mermaid\ngraph TD\n    A --> B\n```\n\n"
+            "Some text between.\n\n"
+            "```mermaid\ngraph LR\n    C --> D\n```"
+        )
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+
+        assert len(placeholders) == 2
+        assert content.count("MERMAID_PLACEHOLDER_") == 2
+        assert "Some text between." in content
+
+    def test_no_mermaid_returns_empty_placeholders(self):
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = "Just regular markdown with no mermaid."
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+
+        assert content == markdown
+        assert placeholders == {}
+
+    def test_placeholder_unwrapped_from_p_tags(self):
+        """Pandoc may wrap a standalone placeholder in <p> tags — substitution should handle that."""
+        confluence = MagicMock()
+        page_id = "12345"
+        markdown = "```mermaid\ngraph TD\n    A --> B\n```"
+
+        content, placeholders = self._run(confluence, page_id, markdown)
+
+        # Simulate what Pandoc does: wrap placeholder in <p> tags
+        wrapped = f"<p>{content}</p>"
+        result = self._resolve(wrapped, placeholders)
+
+        # Should have the real macros, not wrapped in <p>
+        assert "ac:image" in result
+        assert f"<p>MERMAID_PLACEHOLDER_" not in result

@@ -7,9 +7,10 @@ It adds to it the ability to retain comments from the previous version of the
 Confluence page.
 """
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import argparse
+import json
 import os
 import sys
 import re
@@ -20,6 +21,7 @@ import requests
 import difflib
 import uuid
 import tempfile
+from html import escape as html_escape
 from atlassian import Confluence
 from bs4 import BeautifulSoup
 from bs4.element import CData
@@ -174,6 +176,30 @@ def parse_args() -> argparse.Namespace:
             "Can also be set via PUPPETEER_CONFIG or MERMAID_PUPPETEER_CONFIG. "
             'Example config: {"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}'
         ),
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Confluence label to apply to the page. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--page-properties",
+        help=(
+            "JSON array defining a Confluence Page Properties macro to prepend to the page. "
+            "Prefix with @ to read from a file (e.g. @rfc-header.json). "
+            "Each element is {\"label\": \"...\", \"value\": \"...\"} for plain text, or "
+            "{\"label\": \"...\", \"value\": {\"type\": \"status\", \"text\": \"...\", \"color\": \"...\"}} "
+            "for a status lozenge. Supported value types: plain string, "
+            "{\"type\": \"status\", \"text\": \"DRAFT\", \"color\": \"yellow\"} (colors: grey, red, yellow, "
+            "green, blue, purple)."
+        ),
+    )
+    parser.add_argument(
+        "--mermaid-source",
+        action="store_true",
+        default=False,
+        help="Include the original mermaid diagram source as a collapsed code block after each rendered image.",
     )
 
     return parser.parse_args()
@@ -353,6 +379,88 @@ def normalize_confluence_list_spacing(html: str) -> str:
     return str(soup)
 
 
+def parse_page_properties_arg(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parse the --page-properties argument.  Accepts either a JSON literal or
+    ``@path/to/file.json``.  Returns the parsed list of row dicts.
+    """
+    if raw.startswith("@"):
+        file_path = raw[1:]
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read page-properties file '{file_path}': {e}")
+            sys.exit(1)
+    else:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON for --page-properties: {e}")
+            sys.exit(1)
+
+    if not isinstance(data, list):
+        logger.error("--page-properties must be a JSON array of {label, value} objects.")
+        sys.exit(1)
+
+    return data
+
+
+def _render_cell_value(value: Union[str, Dict[str, str]]) -> str:
+    """
+    Render a single cell value to Confluence storage-format HTML.
+
+    * Plain string  → escaped text
+    * ``{"type": "status", "text": "...", "color": "..."}`` → status lozenge macro
+    """
+    if isinstance(value, str):
+        return html_escape(value)
+
+    vtype = value.get("type", "")
+
+    if vtype == "status":
+        text = html_escape(value.get("text", ""))
+        # Confluence status macro uses "colour" (British spelling) and capitalised colour names.
+        color = html_escape(value.get("color", "grey").capitalize())
+        return (
+            f'<ac:structured-macro ac:name="status" ac:schema-version="1">'
+            f'<ac:parameter ac:name="colour">{color}</ac:parameter>'
+            f'<ac:parameter ac:name="title">{text}</ac:parameter>'
+            f'</ac:structured-macro>'
+        )
+
+    logger.warning(f"Unknown page-properties value type '{vtype}', rendering as text")
+    return str(value)
+
+
+def build_page_properties_html(rows: List[Dict[str, Any]]) -> str:
+    """
+    Build the Confluence storage-format XML for a Page Properties (``details``)
+    macro containing a two-column table: bold header labels on the left, values
+    on the right.
+    """
+    table_rows = []
+    for row in rows:
+        label = html_escape(row.get("label", ""))
+        value = row.get("value", "")
+        rendered_value = _render_cell_value(value)
+        table_rows.append(
+            f"<tr>"
+            f"<th><p><strong>{label}</strong></p></th>"
+            f"<td><p>{rendered_value}</p></td>"
+            f"</tr>"
+        )
+
+    macro_id = str(uuid.uuid4())
+    return (
+        f'<ac:structured-macro ac:name="details" ac:schema-version="1" ac:macro-id="{macro_id}">'
+        f"<ac:rich-text-body>"
+        f"<table><tbody>{''.join(table_rows)}</tbody></table>"
+        f"</ac:rich-text-body>"
+        f"</ac:structured-macro>"
+    )
+
+
 def tighten_markdown_lists(markdown: str) -> str:
     """
     Remove blank lines between consecutive list items so Pandoc emits "tight" lists.
@@ -497,12 +605,22 @@ def process_mermaid_images(
     markdown_content: str,
     scale: float = 1.0,
     puppeteer_config: Optional[str] = None,
-) -> str:
+    include_source: bool = False,
+) -> tuple[str, dict[str, str]]:
     """
     Finds mermaid code blocks, renders them to PNG using mmdc, uploads them,
-    and replaces the blocks with Confluence image macros.
+    and replaces the blocks with unique placeholders.
+
+    Returns (modified_content, placeholders_dict) where placeholders_dict maps
+    placeholder strings to the actual Confluence macro HTML.  The caller must
+    substitute these back AFTER markdown-to-HTML conversion so the converter
+    does not mangle the raw Confluence XML.
+
+    If *include_source* is True, a collapsed code block containing the original
+    mermaid source is appended after each rendered image.
     """
     mermaid_pattern = re.compile(r"```mermaid\s*\n(.*?)\n\s*```", re.DOTALL)
+    placeholders: dict[str, str] = {}
 
     def replace_with_image(match: re.Match) -> str:
         mermaid_content = match.group(1)
@@ -536,8 +654,24 @@ def process_mermaid_images(
             logger.info(f"Uploading mermaid diagram: {filename}")
             confluence.attach_file(png_path, name=filename, page_id=page_id)
 
-            # 3. Return Image Macro
-            return f'<ac:image ac:width="100%"><ri:attachment ri:filename="{filename}" /></ac:image>'
+            # 3. Store the real Confluence macros and return a placeholder
+            # The placeholder survives markdown-to-HTML conversion unmangled,
+            # then gets swapped for the real macros afterwards.
+            image_macro = f'<ac:image ac:width="100%"><ri:attachment ri:filename="{filename}" /></ac:image>'
+            real_html = image_macro
+            if include_source:
+                source_macro = (
+                    f'<ac:structured-macro ac:name="code" ac:schema-version="1">'
+                    f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
+                    f'<ac:parameter ac:name="collapse">true</ac:parameter>'
+                    f'<ac:parameter ac:name="title">Diagram source</ac:parameter>'
+                    f'<ac:plain-text-body><![CDATA[{mermaid_content}]]></ac:plain-text-body>'
+                    f'</ac:structured-macro>'
+                )
+                real_html = f"{image_macro}\n{source_macro}"
+            placeholder = f"MERMAID_PLACEHOLDER_{uuid.uuid4().hex}"
+            placeholders[placeholder] = real_html
+            return placeholder
 
         except (RuntimeError, FileNotFoundError):
             logger.exception(
@@ -553,7 +687,8 @@ def process_mermaid_images(
             if os.path.exists(png_path):
                 os.remove(png_path)
 
-    return mermaid_pattern.sub(replace_with_image, markdown_content)
+    result = mermaid_pattern.sub(replace_with_image, markdown_content)
+    return result, placeholders
 
 
 def process_images(
@@ -861,12 +996,13 @@ def main() -> None:
     # 3. Image Handling
     base_path = os.path.dirname(os.path.abspath(args.file))
     body_content = process_images(confluence, page_id, body_content, base_path)
-    body_content = process_mermaid_images(
+    body_content, mermaid_placeholders = process_mermaid_images(
         confluence,
         page_id,
         body_content,
         scale=args.scale_mermaid,
         puppeteer_config=args.puppeteer_config,
+        include_source=args.mermaid_source,
     )
 
     # 4. HTML Conversion
@@ -875,6 +1011,14 @@ def main() -> None:
     except (RuntimeError, FileNotFoundError):
         logger.exception("HTML conversion failed")
         sys.exit(1)
+
+    # 4b. Substitute mermaid placeholders back with real Confluence macros
+    # This must happen AFTER HTML conversion so the converter doesn't mangle
+    # the raw Confluence XML (ac:structured-macro, CDATA, etc.)
+    for placeholder, real_html in mermaid_placeholders.items():
+        # The placeholder may have been wrapped in <p> tags by the converter
+        html_content = html_content.replace(f"<p>{placeholder}</p>", real_html)
+        html_content = html_content.replace(placeholder, real_html)
 
     # 5. Comment Preservation
     # Fetch existing content to get comments
@@ -901,6 +1045,13 @@ def main() -> None:
     # preserve_comments() reparses HTML; run list normalization again defensively.
     final_html = normalize_confluence_list_spacing(html_content)
 
+    # 5b. Page Properties macro (prepended as raw storage-format XML)
+    if args.page_properties:
+        rows = parse_page_properties_arg(args.page_properties)
+        props_html = build_page_properties_html(rows)
+        logger.info(f"Prepending Page Properties macro ({len(rows)} fields)")
+        final_html = props_html + final_html
+
     # 6. Page Update
     logger.info(f"Updating page {page_id}...")
     try:
@@ -919,6 +1070,16 @@ def main() -> None:
         sys.exit(1)
 
     enforce_page_width_workaround(confluence, page_id)
+
+    # 7. Label Application
+    for label in args.label:
+        label = label.strip()
+        if label:
+            logger.info(f"Applying label: {label}")
+            try:
+                confluence.set_page_label(page_id, label)
+            except Exception as e:
+                logger.warning(f"Failed to apply label '{label}': {e}")
 
     base_url = result["_links"].get("base", args.confluence_url).rstrip("/")
     webui = result["_links"]["webui"]
