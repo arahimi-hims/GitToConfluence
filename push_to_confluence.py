@@ -20,6 +20,7 @@ import requests
 import difflib
 import uuid
 import tempfile
+from html import escape as html_escape
 from atlassian import Confluence
 from bs4 import BeautifulSoup
 from bs4.element import CData
@@ -175,8 +176,47 @@ def parse_args() -> argparse.Namespace:
             'Example config: {"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}'
         ),
     )
+    parser.add_argument(
+        "--property",
+        action="append",
+        default=[],
+        help=(
+            "Add a Page Properties macro entry as key=value. "
+            "Repeatable (e.g. --property Title=RFC --property Squad=Platform). "
+            "Values are plain text and will be HTML-escaped."
+        ),
+    )
 
     return parser.parse_args()
+
+
+def build_page_properties_html(properties: List[str]) -> str:
+    """
+    Build a Confluence Page Properties (``details``) macro from a list of
+    ``key=value`` strings.
+
+    Each string is split on the **first** ``=`` so that values may contain
+    additional ``=`` characters.  Both keys and values are HTML-escaped.
+
+    Returns a Confluence storage-format HTML fragment.
+    """
+    rows: List[str] = []
+    for prop in properties:
+        key, _, value = prop.partition("=")
+        rows.append(
+            f"<tr><th><p><strong>{html_escape(key)}</strong></p></th>"
+            f"<td><p>{html_escape(value)}</p></td></tr>"
+        )
+
+    macro_id = str(uuid.uuid4())
+    return (
+        f'<ac:structured-macro ac:name="details" ac:schema-version="1" '
+        f'ac:macro-id="{macro_id}">'
+        f"<ac:rich-text-body>"
+        f"<table><tbody>{''.join(rows)}</tbody></table>"
+        f"</ac:rich-text-body>"
+        f"</ac:structured-macro>"
+    )
 
 
 def convert_markdown_to_html(markdown_content: str) -> str:
@@ -900,6 +940,10 @@ def main() -> None:
     html_content = preserve_comments(current_body, html_content)
     # preserve_comments() reparses HTML; run list normalization again defensively.
     final_html = normalize_confluence_list_spacing(html_content)
+
+    # 5b. Page Properties macro
+    if args.property:
+        final_html = build_page_properties_html(args.property) + final_html
 
     # 6. Page Update
     logger.info(f"Updating page {page_id}...")

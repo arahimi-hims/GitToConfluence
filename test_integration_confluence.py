@@ -9,6 +9,22 @@ from atlassian import Confluence
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "push_to_confluence.py")
+
+
+def run_push(md_file, space, extra_args=None):
+    """Run push_to_confluence.py as a subprocess and assert success."""
+    cmd = [
+        sys.executable,
+        SCRIPT_PATH,
+        str(md_file),
+        "--space", space,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 class TestConfluenceIntegration:
     @pytest.fixture
     def page_title(self):
@@ -35,6 +51,10 @@ class TestConfluenceIntegration:
         page = confluence.get_page_by_title(space, page_title)
         if page:
             confluence.remove_page(page["id"], status=None, recursive=False)
+
+    def _get_body(self, confluence, page_id):
+        """Return the storage-format body HTML for a page."""
+        return confluence.get_page_by_id(page_id, expand="body.storage")["body"]["storage"]["value"]
 
     def test_full_lifecycle(self, confluence, space, page_title, cleanup_page, tmp_path):
         """
@@ -139,3 +159,52 @@ class TestConfluenceIntegration:
         # Ensure the marker wraps "Item A"
         expected_marker_segment = f'<ac:inline-comment-marker ac:ref="{comment_uuid}">Item A</ac:inline-comment-marker>'
         assert expected_marker_segment in final_body, "Comment marker does not wrap the correct content!"
+
+    def test_page_properties(self, confluence, space, page_title, cleanup_page, tmp_path):
+        """Push with --property flags and verify the Page Properties macro appears in the body."""
+        md_file = tmp_path / "test_props.md"
+        md_file.write_text(f"# {page_title}\n\nPage properties test content.\n")
+
+        run_push(md_file, space, extra_args=[
+            "--header", "test",
+            "--property", "Title=Test RFC",
+            "--property", "Squad=Platform",
+        ])
+
+        page = confluence.get_page_by_title(space, page_title)
+        assert page is not None, "Page was not created"
+        page_id = page["id"]
+
+        body = self._get_body(confluence, page_id)
+        assert 'ac:name="details"' in body, "Page Properties macro not found in body"
+        assert "Test RFC" in body, "Property value 'Test RFC' missing"
+        assert "Platform" in body, "Property value 'Platform' missing"
+
+    def test_page_properties_survives_repush(self, confluence, space, page_title, cleanup_page, tmp_path):
+        """Push v1 with one property value, re-push v2 with an updated value, verify the update."""
+        md_file_v1 = tmp_path / "test_props_v1.md"
+        md_file_v1.write_text(f"# {page_title}\n\nVersion 1.\n")
+
+        run_push(md_file_v1, space, extra_args=[
+            "--header", "test",
+            "--property", "Status=DRAFT",
+        ])
+
+        page = confluence.get_page_by_title(space, page_title)
+        assert page is not None
+        page_id = page["id"]
+
+        body_v1 = self._get_body(confluence, page_id)
+        assert "DRAFT" in body_v1
+
+        # Re-push with updated property
+        md_file_v2 = tmp_path / "test_props_v2.md"
+        md_file_v2.write_text(f"# {page_title}\n\nVersion 2.\n")
+
+        run_push(md_file_v2, space, extra_args=[
+            "--header", "test",
+            "--property", "Status=APPROVED",
+        ])
+
+        body_v2 = self._get_body(confluence, page_id)
+        assert "APPROVED" in body_v2, "Updated property value 'APPROVED' missing after re-push"
