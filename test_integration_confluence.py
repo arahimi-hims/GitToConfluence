@@ -9,6 +9,16 @@ from atlassian import Confluence
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def run_push(md_file, space, extra_args=None):
+    """Run push_to_confluence.py via subprocess with the given markdown file."""
+    script_path = os.path.join(os.path.dirname(__file__), "push_to_confluence.py")
+    cmd = [sys.executable, script_path, str(md_file), "--space", space]
+    if extra_args:
+        cmd.extend(extra_args)
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 class TestConfluenceIntegration:
     @pytest.fixture
     def page_title(self):
@@ -35,6 +45,10 @@ class TestConfluenceIntegration:
         page = confluence.get_page_by_title(space, page_title)
         if page:
             confluence.remove_page(page["id"], status=None, recursive=False)
+
+    def _get_body(self, confluence, page_id):
+        """Fetch the storage-format body of a page."""
+        return confluence.get_page_by_id(page_id, expand="body.storage")["body"]["storage"]["value"]
 
     def test_full_lifecycle(self, confluence, space, page_title, cleanup_page, tmp_path):
         """
@@ -139,3 +153,40 @@ class TestConfluenceIntegration:
         # Ensure the marker wraps "Item A"
         expected_marker_segment = f'<ac:inline-comment-marker ac:ref="{comment_uuid}">Item A</ac:inline-comment-marker>'
         assert expected_marker_segment in final_body, "Comment marker does not wrap the correct content!"
+
+    def test_mermaid_default_includes_source(self, confluence, space, page_title, cleanup_page, tmp_path):
+        """Push mermaid with default settings; both image and collapsed source should be present."""
+        md_file = tmp_path / "mermaid_default.md"
+        md_file.write_text(
+            f"# {page_title}\n\n"
+            "```mermaid\n"
+            "graph TD;\n"
+            "  A-->B;\n"
+            "```\n"
+        )
+        run_push(md_file, space, extra_args=["--header", "test"])
+
+        page = confluence.get_page_by_title(space, page_title)
+        assert page is not None, "Page was not created"
+        body = self._get_body(confluence, page["id"])
+        assert "ac:image" in body, "Mermaid image macro missing"
+        assert 'ac:name="code"' in body, "Source code block should be present by default"
+        assert "graph TD;" in body, "Mermaid source content missing from code block"
+
+    def test_mermaid_source_excluded_with_flag(self, confluence, space, page_title, cleanup_page, tmp_path):
+        """Push with --no-mermaid-source; image should be present but source should NOT."""
+        md_file = tmp_path / "mermaid_no_source.md"
+        md_file.write_text(
+            f"# {page_title}\n\n"
+            "```mermaid\n"
+            "graph TD;\n"
+            "  A-->B;\n"
+            "```\n"
+        )
+        run_push(md_file, space, extra_args=["--header", "test", "--no-mermaid-source"])
+
+        page = confluence.get_page_by_title(space, page_title)
+        assert page is not None, "Page was not created"
+        body = self._get_body(confluence, page["id"])
+        assert "ac:image" in body, "Mermaid image macro missing"
+        assert 'ac:name="code"' not in body, "Source code block should not be present with --no-mermaid-source"

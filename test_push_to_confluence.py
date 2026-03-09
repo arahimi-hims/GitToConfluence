@@ -1,4 +1,5 @@
 import logging
+import re
 from unittest.mock import MagicMock, patch
 from push_to_confluence import (
     convert_heading_ids_to_confluence_anchors,
@@ -6,6 +7,7 @@ from push_to_confluence import (
     normalize_table_widths,
     preserve_comments,
     process_images,
+    process_mermaid_images,
 )
 
 
@@ -387,3 +389,92 @@ class TestProcessImages:
             '<ac:image ><ri:attachment ri:filename="image.png" /></ac:image>' in result
         )
         confluence.attach_file.assert_called_once()
+
+
+class TestProcessMermaidImages:
+    """Tests for process_mermaid_images with the placeholder approach."""
+
+    SIMPLE_MD = "```mermaid\ngraph TD;\n  A-->B;\n```"
+
+    def _run(self, markdown, include_source=False):
+        """Run process_mermaid_images with mocked externals."""
+        confluence = MagicMock()
+        with (
+            patch("push_to_confluence.run_command"),
+            patch("os.path.exists", return_value=True),
+            patch("os.remove"),
+        ):
+            content, placeholders = process_mermaid_images(
+                confluence,
+                "12345",
+                markdown,
+                include_source=include_source,
+            )
+        return content, placeholders
+
+    def _resolve(self, content, placeholders):
+        """Simulate the placeholder substitution that main() performs after Pandoc."""
+        for placeholder, real_html in placeholders.items():
+            content = content.replace(f"<p>{placeholder}</p>", real_html)
+            content = content.replace(placeholder, real_html)
+        return content
+
+    def test_returns_placeholder_and_dict(self):
+        content, placeholders = self._run(self.SIMPLE_MD)
+        assert "MERMAID_PLACEHOLDER_" in content
+        assert len(placeholders) == 1
+        # Raw XML should NOT be in the content at this stage
+        assert "<ac:image" not in content
+
+    def test_default_no_source_block(self):
+        content, placeholders = self._run(self.SIMPLE_MD, include_source=False)
+        resolved = self._resolve(content, placeholders)
+        assert 'ac:name="code"' not in resolved
+
+    def test_include_source_adds_collapsed_code_block(self):
+        content, placeholders = self._run(self.SIMPLE_MD, include_source=True)
+        resolved = self._resolve(content, placeholders)
+        assert 'ac:name="code"' in resolved
+        assert 'ac:name="language">mermaid<' in resolved
+        assert 'ac:name="collapse">true<' in resolved
+        assert "graph TD;" in resolved
+
+    def test_include_source_arrows_no_escaping(self):
+        md = "```mermaid\nsequenceDiagram\n  A->>B: Hello\n  B-->A: Reply\n```"
+        content, placeholders = self._run(md, include_source=True)
+        resolved = self._resolve(content, placeholders)
+        # --> must survive verbatim inside CDATA, not be HTML-escaped
+        assert "B-->A: Reply" in resolved
+
+    def test_mermaid_image_macro_present(self):
+        content, placeholders = self._run(self.SIMPLE_MD)
+        resolved = self._resolve(content, placeholders)
+        assert "<ac:image" in resolved
+        assert "ri:attachment" in resolved
+
+    def test_multiple_diagrams_get_separate_placeholders(self):
+        md = (
+            "```mermaid\ngraph TD;\n  A-->B;\n```\n\n"
+            "```mermaid\ngraph LR;\n  C-->D;\n```"
+        )
+        content, placeholders = self._run(md)
+        assert len(placeholders) == 2
+        # Each placeholder should be unique
+        keys = list(placeholders.keys())
+        assert keys[0] != keys[1]
+
+    def test_no_mermaid_returns_empty_placeholders(self):
+        md = "Just some text with no mermaid blocks."
+        content, placeholders = self._run(md)
+        assert content == md
+        assert placeholders == {}
+
+    def test_placeholder_unwrapped_from_p_tags(self):
+        content, placeholders = self._run(self.SIMPLE_MD)
+        # Simulate Pandoc wrapping the placeholder in <p> tags
+        placeholder = list(placeholders.keys())[0]
+        wrapped = f"<p>{placeholder}</p>"
+        resolved = self._resolve(wrapped, placeholders)
+        # The <p> wrapper should be gone, replaced by the real HTML
+        assert resolved.startswith("<ac:image")
+        assert "<p>MERMAID_PLACEHOLDER_" not in resolved
