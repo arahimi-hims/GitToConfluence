@@ -7,7 +7,7 @@ It adds to it the ability to retain comments from the previous version of the
 Confluence page.
 """
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import argparse
 import os
@@ -174,6 +174,12 @@ def parse_args() -> argparse.Namespace:
             "Can also be set via PUPPETEER_CONFIG or MERMAID_PUPPETEER_CONFIG. "
             'Example config: {"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}'
         ),
+    )
+    parser.add_argument(
+        "--no-mermaid-source",
+        action="store_true",
+        default=False,
+        help="Disable preserving the original Mermaid source in a collapsed code block after each rendered diagram.",
     )
 
     return parser.parse_args()
@@ -497,12 +503,18 @@ def process_mermaid_images(
     markdown_content: str,
     scale: float = 1.0,
     puppeteer_config: Optional[str] = None,
-) -> str:
+    include_source: bool = False,
+) -> Tuple[str, Dict[str, str]]:
     """
     Finds mermaid code blocks, renders them to PNG using mmdc, uploads them,
-    and replaces the blocks with Confluence image macros.
+    and replaces the blocks with plaintext placeholders. Returns the modified
+    markdown and a dict mapping each placeholder to its real Confluence HTML.
+
+    The placeholder approach prevents Pandoc from mangling raw Confluence XML
+    during the markdown-to-HTML conversion step.
     """
     mermaid_pattern = re.compile(r"```mermaid\s*\n(.*?)\n\s*```", re.DOTALL)
+    placeholders: Dict[str, str] = {}
 
     def replace_with_image(match: re.Match) -> str:
         mermaid_content = match.group(1)
@@ -536,8 +548,24 @@ def process_mermaid_images(
             logger.info(f"Uploading mermaid diagram: {filename}")
             confluence.attach_file(png_path, name=filename, page_id=page_id)
 
-            # 3. Return Image Macro
-            return f'<ac:image ac:width="100%"><ri:attachment ri:filename="{filename}" /></ac:image>'
+            # 3. Build the real HTML (image macro + optional source block)
+            image_macro = f'<ac:image ac:width="100%"><ri:attachment ri:filename="{filename}" /></ac:image>'
+
+            real_html = image_macro
+            if include_source:
+                real_html += (
+                    '\n<ac:structured-macro ac:name="code" ac:schema-version="1">'
+                    '\n<ac:parameter ac:name="language">mermaid</ac:parameter>'
+                    '\n<ac:parameter ac:name="collapse">true</ac:parameter>'
+                    '\n<ac:parameter ac:name="title">Diagram source</ac:parameter>'
+                    f'\n<ac:plain-text-body><![CDATA[{mermaid_content}]]></ac:plain-text-body>'
+                    '\n</ac:structured-macro>'
+                )
+
+            # 4. Return a plaintext placeholder (safe for Pandoc)
+            placeholder = f"MERMAID_PLACEHOLDER_{uuid.uuid4().hex}"
+            placeholders[placeholder] = real_html
+            return placeholder
 
         except (RuntimeError, FileNotFoundError):
             logger.exception(
@@ -553,7 +581,8 @@ def process_mermaid_images(
             if os.path.exists(png_path):
                 os.remove(png_path)
 
-    return mermaid_pattern.sub(replace_with_image, markdown_content)
+    result = mermaid_pattern.sub(replace_with_image, markdown_content)
+    return result, placeholders
 
 
 def process_images(
@@ -861,12 +890,13 @@ def main() -> None:
     # 3. Image Handling
     base_path = os.path.dirname(os.path.abspath(args.file))
     body_content = process_images(confluence, page_id, body_content, base_path)
-    body_content = process_mermaid_images(
+    body_content, mermaid_placeholders = process_mermaid_images(
         confluence,
         page_id,
         body_content,
         scale=args.scale_mermaid,
         puppeteer_config=args.puppeteer_config,
+        include_source=not args.no_mermaid_source,
     )
 
     # 4. HTML Conversion
@@ -875,6 +905,11 @@ def main() -> None:
     except (RuntimeError, FileNotFoundError):
         logger.exception("HTML conversion failed")
         sys.exit(1)
+
+    # 4b. Replace mermaid placeholders with real Confluence macros
+    for placeholder, real_html in mermaid_placeholders.items():
+        html_content = html_content.replace(f"<p>{placeholder}</p>", real_html)
+        html_content = html_content.replace(placeholder, real_html)
 
     # 5. Comment Preservation
     # Fetch existing content to get comments
