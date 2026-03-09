@@ -1,6 +1,7 @@
 import logging
 from unittest.mock import MagicMock, patch
 from push_to_confluence import (
+    build_page_properties_html,
     convert_heading_ids_to_confluence_anchors,
     extract_title_and_body,
     normalize_table_widths,
@@ -387,3 +388,35 @@ class TestProcessImages:
             '<ac:image ><ri:attachment ri:filename="image.png" /></ac:image>' in result
         )
         confluence.attach_file.assert_called_once()
+
+
+class TestBuildPagePropertiesHtml:
+    def test_basic_properties(self):
+        result = build_page_properties_html(["Title=My RFC", "Squad=Weight Loss"])
+        assert 'ac:name="details"' in result
+        assert "<strong>Title</strong>" in result
+        assert "My RFC" in result
+        assert "<strong>Squad</strong>" in result
+        assert "Weight Loss" in result
+
+    def test_value_with_equals(self):
+        result = build_page_properties_html(["Formula=a=b+c"])
+        assert "<strong>Formula</strong>" in result
+        assert "a=b+c" in result
+
+    def test_html_escaped(self):
+        result = build_page_properties_html(["Key=<script>alert(1)</script>"])
+        assert "&lt;script&gt;" in result
+        assert "<script>" not in result
+
+    def test_empty_list(self):
+        result = build_page_properties_html([])
+        assert 'ac:name="details"' in result
+        assert "<tbody>" in result
+
+    def test_order_preserved(self):
+        result = build_page_properties_html(["A=1", "B=2", "C=3"])
+        pos_a = result.index("<strong>A</strong>")
+        pos_b = result.index("<strong>B</strong>")
+        pos_c = result.index("<strong>C</strong>")
+        assert pos_a < pos_b < pos_c
