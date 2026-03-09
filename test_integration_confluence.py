@@ -9,6 +9,22 @@ from atlassian import Confluence
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "push_to_confluence.py")
+
+
+def run_push(md_file, space, extra_args=None):
+    """Run push_to_confluence.py as a subprocess and assert success."""
+    cmd = [
+        sys.executable,
+        SCRIPT_PATH,
+        str(md_file),
+        "--space", space,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 class TestConfluenceIntegration:
     @pytest.fixture
     def page_title(self):
@@ -35,6 +51,10 @@ class TestConfluenceIntegration:
         page = confluence.get_page_by_title(space, page_title)
         if page:
             confluence.remove_page(page["id"], status=None, recursive=False)
+
+    def _get_body(self, confluence, page_id):
+        """Return the storage-format body HTML for a page."""
+        return confluence.get_page_by_id(page_id, expand="body.storage")["body"]["storage"]["value"]
 
     def test_full_lifecycle(self, confluence, space, page_title, cleanup_page, tmp_path):
         """
@@ -139,3 +159,41 @@ class TestConfluenceIntegration:
         # Ensure the marker wraps "Item A"
         expected_marker_segment = f'<ac:inline-comment-marker ac:ref="{comment_uuid}">Item A</ac:inline-comment-marker>'
         assert expected_marker_segment in final_body, "Comment marker does not wrap the correct content!"
+
+    def test_labels(self, confluence, space, page_title, cleanup_page, tmp_path):
+        """
+        Tests that --label applies Confluence labels and that labels are
+        additive across re-pushes (existing labels are not removed).
+        """
+        md_file = tmp_path / "test_labels.md"
+        md_file.write_text(f"# {page_title}\n\nLabel test content.\n")
+
+        # --- Push with two labels ---
+        logger.info("Pushing with --label test-label-a --label test-label-b")
+        run_push(md_file, space, extra_args=[
+            "--header", "test",
+            "--label", "test-label-a",
+            "--label", "test-label-b",
+        ])
+
+        page = confluence.get_page_by_title(space, page_title)
+        assert page is not None, "Page was not created"
+        page_id = page["id"]
+
+        labels = confluence.get_page_labels(page_id)
+        label_names = {l["name"] for l in labels.get("results", [])}
+        assert "test-label-a" in label_names, f"test-label-a missing from {label_names}"
+        assert "test-label-b" in label_names, f"test-label-b missing from {label_names}"
+
+        # --- Re-push with a third label only ---
+        logger.info("Re-pushing with --label test-label-c")
+        run_push(md_file, space, extra_args=[
+            "--header", "test",
+            "--label", "test-label-c",
+        ])
+
+        labels = confluence.get_page_labels(page_id)
+        label_names = {l["name"] for l in labels.get("results", [])}
+        assert "test-label-a" in label_names, f"test-label-a lost after re-push: {label_names}"
+        assert "test-label-b" in label_names, f"test-label-b lost after re-push: {label_names}"
+        assert "test-label-c" in label_names, f"test-label-c missing after re-push: {label_names}"

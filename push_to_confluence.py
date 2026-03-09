@@ -175,8 +175,33 @@ def parse_args() -> argparse.Namespace:
             'Example config: {"executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}'
         ),
     )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Confluence label to apply to the page. Repeatable (--label foo --label bar).",
+    )
 
     return parser.parse_args()
+
+
+def apply_labels(confluence: Confluence, page_id: str, labels: List[str]) -> List[str]:
+    """
+    Apply labels to a Confluence page.  Attempts every label even if some
+    fail.  Returns the list of labels that failed to apply.
+    """
+    failed: List[str] = []
+    for raw_label in labels:
+        label = raw_label.strip()
+        if not label:
+            continue
+        try:
+            confluence.set_page_label(page_id, label)
+            logger.info(f"Applied label: {label}")
+        except Exception:
+            logger.error(f"Failed to apply label: {label}", exc_info=True)
+            failed.append(label)
+    return failed
 
 
 def convert_markdown_to_html(markdown_content: str) -> str:
@@ -920,10 +945,17 @@ def main() -> None:
 
     enforce_page_width_workaround(confluence, page_id)
 
+    # 7. Label Application
+    failed_labels = apply_labels(confluence, page_id, args.label)
+
     base_url = result["_links"].get("base", args.confluence_url).rstrip("/")
     webui = result["_links"]["webui"]
     full_url = f"{base_url}{webui}"
     logger.info(f"Page URL: {full_url}")
+
+    if failed_labels:
+        logger.error(f"Failed to apply labels: {', '.join(failed_labels)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
