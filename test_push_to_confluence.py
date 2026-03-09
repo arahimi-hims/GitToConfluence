@@ -1,6 +1,7 @@
 import logging
 from unittest.mock import MagicMock, patch
 from push_to_confluence import (
+    apply_labels,
     convert_heading_ids_to_confluence_anchors,
     extract_title_and_body,
     normalize_table_widths,
@@ -387,3 +388,44 @@ class TestProcessImages:
             '<ac:image ><ri:attachment ri:filename="image.png" /></ac:image>' in result
         )
         confluence.attach_file.assert_called_once()
+
+
+class TestApplyLabels:
+    def test_applies_all_labels(self):
+        confluence = MagicMock()
+        failed = apply_labels(confluence, "123", ["alpha", "beta"])
+        assert failed == []
+        assert confluence.set_page_label.call_count == 2
+        confluence.set_page_label.assert_any_call("123", "alpha")
+        confluence.set_page_label.assert_any_call("123", "beta")
+
+    def test_skips_blank_labels(self):
+        confluence = MagicMock()
+        failed = apply_labels(confluence, "123", ["", "  ", "valid"])
+        assert failed == []
+        confluence.set_page_label.assert_called_once_with("123", "valid")
+
+    def test_strips_whitespace(self):
+        confluence = MagicMock()
+        failed = apply_labels(confluence, "123", ["  padded  "])
+        assert failed == []
+        confluence.set_page_label.assert_called_once_with("123", "padded")
+
+    def test_returns_failed_labels(self):
+        confluence = MagicMock()
+        confluence.set_page_label.side_effect = [None, Exception("API error"), None]
+        failed = apply_labels(confluence, "123", ["a", "b", "c"])
+        assert failed == ["b"]
+        assert confluence.set_page_label.call_count == 3
+
+    def test_all_fail(self):
+        confluence = MagicMock()
+        confluence.set_page_label.side_effect = Exception("down")
+        failed = apply_labels(confluence, "123", ["x", "y"])
+        assert failed == ["x", "y"]
+
+    def test_empty_list(self):
+        confluence = MagicMock()
+        failed = apply_labels(confluence, "123", [])
+        assert failed == []
+        confluence.set_page_label.assert_not_called()
